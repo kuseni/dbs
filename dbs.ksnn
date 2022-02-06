@@ -1,0 +1,129 @@
+// Copyright (c) 2022 Kupor Sergei. All rights reserved.
+
+// - imports -
+const { log } = console;
+const { argv, hrtime: { bigint: hrtime }, exit } = process;
+const { mkdir, readFile, unlink, writeFile } = require('fs/promises');
+const { existsSync } = require('fs');
+const sql = require('msnodesqlv8');
+const { normalize: normPath } = require('path');
+const { Worker } = require('worker_threads');
+
+// - fns -
+function lognonl(str) { process.stdout.write(str); }	// TypeError: Cannot read properties of undefined (reading '_writableState') in destructuring assignment
+function logok(str) { log('\x1b[32m%s\x1b[0m', str); }
+function logwa(str) { log('\x1b[38;5;11m%s\x1b[0m', str); }
+
+function logExit(str) {
+	log('\x1b[38;5;196mERROR: %s\x1b[0m', str);
+	exit();
+}
+
+function done(start, dbms) {
+	log(`done, total ${('' + (hrtime() - start) / 1000000n).padStart(5, ' ')} ms` + (dbms != null ? `, db ${('' + dbms).padStart(5, ' ')} ms` : '')); 
+}
+
+// - process -
+(async () => {
+	const start = hrtime();
+
+	if(argv.length < 4) {
+		log('Usage: dbs SERVER DATABASE [PATH]');
+		exit();
+	}
+	
+	const [ , , srv, db, pathx ] = argv;
+	const path = pathx ? pathx + (pathx.endsWith('\\') ? '' : '\\') : `z:\\dbs\\${srv}.${db}\\`;
+	if(!existsSync(path))
+		logExit(`target folder "${path.slice(0, -1)}" must exist`);
+
+	const connStr = `Driver={ODBC Driver 17 for SQL Server};APP=KsnFw.dbs;Server=${srv};Database=${db};Trusted_Connection=Yes;`;
+	const pfx = __filename.match(/.*\./)[0];
+	const tune = existsSync(pfx + db + '.sql') ? await readFile(pfx + db + '.sql', 'ascii') : '';
+
+	const [ hashes/*{n, s, h}*/, conn ] = await Promise.all([
+		// local
+		new Promise((resolve, reject) => {
+			const worker = new Worker(pfx + '_hashes.js', { workerData: path });
+			worker.on('message', resolve);
+			worker.on('error', reject);
+			worker.on('exit', code => { if(code) reject(new Error(`Worker stopped with exit code ${code}`)) });
+		}),
+		// db
+		(async () => {
+			lognonl('connect db... ');
+			const conn = await sql.promises.open(connStr);
+			done(start);
+
+			lognonl('prepare db... ');
+			const { elapsed } = await conn.promises.query((await readFile(pfx + '_prepare.sql', 'ascii'))
+				.replace(/\/\*<Tune>\*\/[\s\S]*?\/\*<\/Tune>\*\//, () => tune)	// ignore $
+			);
+			done(start, elapsed);
+			return conn;
+		})()
+	]);
+
+	lognonl('sync...       ');
+	const hsql = hashes.length ? 'INSERT #l(p, s, h)\r\n' + hashes.map(i => `SELECT '${i.n}', ${i.s}, 0x${i.h}`).join(' UNION ALL\r\n') : '';
+	const { elapsed, results: [ diff, ignored, desc ] } = await conn.promises.query((await readFile(pfx + '_sync.sql', 'ascii'))
+		.replace(/\/\*<Hashes>\*\/[\s\S]*?\/\*<\/Hashes>\*\//, () => hsql)	// ignore $
+	);
+	done(start, elapsed);
+
+	if(diff.length) {
+		// check & mkdir, sequentially
+		const dirs = {};
+		for(const i of diff) {
+			if(path + i.p != normPath(path + i.p))
+				logExit(`bad path "${i.p}"`);
+
+			if(i.d != null) {
+				const si = i.p.lastIndexOf('\\');
+				if(si != -1) {
+					const dir = i.p.slice(0, si);
+					if(!dirs[dir]) {
+						await mkdir(path + dir, { recursive: true });
+						dirs[dir] = true;
+					}
+				}
+			}
+		}
+
+		// writeFile/unlink, parallel
+		await Promise.all(diff.map(async i => {
+			if(i.d != null) {
+				logwa(`modify ${i.p}...`);
+				await writeFile(path + i.p, `\ufeff${i.d}`, 'ucs2');
+			} else {
+				logwa(`delete ${i.p}...`);
+				await unlink(path + i.p);
+			}
+		}));
+	} else
+		logok('match!');
+
+	if(tune) {
+		if(ignored.length)
+			log('ignored(ok):' + ignored.map(i => '\r\n    ' + i.p).join(''));
+		else
+			logok('no ignored');
+
+		const nodesc = [];
+		const notindb = [];
+		desc.forEach(i => (i.s ? nodesc : notindb).push(i.n));
+
+		if(nodesc.length) {
+			logwa(`NODESC(ADD dbs.${db}.sql):` + nodesc.map(i => `\r\n    ('${i}'),`).join(''));
+			logwa('NODESC(check sql):' + nodesc.map(i => `\r\n    SELECT TOP 10 * FROM ${i}`).join(''));
+		} else
+			logok('no nodesc');
+
+		if(notindb.length) {
+			logwa(`NotInDb(DEL dbs.${db}.sql):` + notindb.map(i => `\r\n    ('${i}'),`).join(''));
+		} else
+			logok('no notindb');
+	}
+
+	done(start);
+})();
